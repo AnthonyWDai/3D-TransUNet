@@ -19,13 +19,13 @@ model_params:
 crop_size: [128,128,128]
 max_loss_cal: 'v1'
 disable_ds: False
-initial_lr: 3e-4
+initial_lr: 1e-3
 optim_name: adamw
 lrschedule: warmup_cosine
 resume: 'auto'
-warmup_epochs: 10
-max_num_epochs: 125 # used 8 cards as default
-task: Task500_BraTS2021
+warmup_epochs: 80
+max_num_epochs: 1000
+task: Task003_PSMA-PET-CT-Lesions_v3
 network: 3d_fullres
-network_trainer: nnUNetTrainerV2_DDP
+network_trainer: nnUNetTrainerV2
 hdfs_base: GeTU500_3DTransUNet_encoder_plus_decoder
