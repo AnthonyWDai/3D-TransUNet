@@ -24,7 +24,7 @@ optim_name: adamw
 lrschedule: warmup_cosine
 resume: 'auto'
 warmup_epochs: 10
-max_num_epochs: 125 # used 8 cards as default
+max_num_epochs: 1000
 task: Task500_BraTS2021
 network: 3d_fullres
 network_trainer: nnUNetTrainerV2_DDP
