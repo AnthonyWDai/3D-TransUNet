@@ -28,4 +28,4 @@ max_num_epochs: 1000
 task: Task003_PSMA-PET-CT-Lesions_v3
 network: 3d_fullres
 network_trainer: nnUNetTrainerV2_DDP
-hdfs_base: GeTU500_3DTransUNet_encoder_plus_decoder
+hdfs_base: GeTU500_3DTransUNet_encoder_plus_decoder5e5
