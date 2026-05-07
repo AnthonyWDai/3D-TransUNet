@@ -21,7 +21,7 @@ from batchgenerators.utilities.file_and_folder_operations import *
 from nn_transunet.networks.neural_network import SegmentationNetwork
 from sklearn.model_selection import KFold
 from torch import nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import _LRScheduler
 from ..trainer.loss_functions import ModelLossSemsegGatedCRF
 
@@ -447,7 +447,7 @@ class NetworkTrainer(object):
 
     def _maybe_init_amp(self):
         if self.fp16 and self.amp_grad_scaler is None:
-            self.amp_grad_scaler = GradScaler()
+            self.amp_grad_scaler = GradScaler("cuda")
 
     def plot_network_architecture(self):
         """
@@ -835,7 +835,7 @@ class NetworkTrainer(object):
         self.optimizer.zero_grad()
 
         if self.fp16:
-            with autocast():
+            with autocast("cuda"):
                 output = self.network(data)
                 del data
                 l = self.loss(output, target)
