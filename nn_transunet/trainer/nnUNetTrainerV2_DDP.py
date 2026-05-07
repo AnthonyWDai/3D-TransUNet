@@ -39,7 +39,7 @@ from nnunet.training.loss_functions.crossentropy import RobustCrossEntropyLoss
 from nnunet.training.loss_functions.dice_loss import get_tp_fp_fn_tn
 from torch import nn, distributed
 from torch.backends import cudnn
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import _LRScheduler
 import torch.nn.functional as F
@@ -497,10 +497,11 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
             if param.grad is not None:
                 valid_gradients = not (torch.isnan(param.grad).any() or torch.isinf(param.grad).any())
                 if not valid_gradients:
+                    print(f"Invalid gradient in {name}")
                     break
 
         if not valid_gradients:
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
 
 
     def run_iteration(self, data_generator, do_backprop=True, run_online_evaluation=False):
@@ -523,7 +524,7 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
 
         if self.fp16:
             with torch.autograd.set_detect_anomaly(True):
-                with autocast():
+                with autocast("cuda"):
                     is_c2f = self.args.model.find('C2F') != -1
                     is_max = self.args.model_params.get('is_max', self.args.model.find('max') != -1)
                     is_max_hungarian = ('is_max_hungarian' in self.args.model_params.keys() and self.args.model_params['is_max_hungarian'])
@@ -549,7 +550,7 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
                             target = target[0]
 
 
-                    l = self.compute_loss(output, target, is_max, is_c2f, self.args.is_sigmoid, is_max_hungarian, is_max_ds, point_rend, num_point_rend, no_object_weight)
+                l = self.compute_loss(output, target, is_max, is_c2f, self.args.is_sigmoid, is_max_hungarian, is_max_ds, point_rend, num_point_rend, no_object_weight)
 
                 if do_backprop:
                     self.amp_grad_scaler.scale(l).backward()
@@ -654,8 +655,9 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
                 for i in range(len(output_ds)):
                     axes = tuple(range(2, len(output_ds[i].size()))) # (2,3,4)
 
-                    with autocast(enabled=False):
-                        output_act = output_ds[i].sigmoid() if is_sigmoid else softmax_helper(output_ds[i]) # bug occurs here..
+                    with autocast("cuda", enabled=False):
+                        logits = output_ds[i].float()
+                        output_act = torch.sigmoid(logits) if is_sigmoid else torch.softmax(logits, dim=1)
                     tp, fp, fn, _ = get_tp_fp_fn_tn(output_act, target_ds[i], axes, mask=None) # target_ds[i] is one-hot, tp: (b, n_class)
                     if do_fg: # 
                         nominator = 2 * tp # already fg
@@ -680,7 +682,7 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
                             target_onehot = torch.zeros_like(output_ds[i], device=output_ds[i].device)
                             target_onehot.scatter_(1, target_ds[i].long(), 1) # target is a tuple
                             assert (torch.argmax(target_onehot, dim=1) == target_ds[i][:, 0].long()).all()
-                        ce_loss = F.binary_cross_entropy_with_logits(output_ds[i], target_onehot)
+                        ce_loss = F.binary_cross_entropy_with_logits(output_ds[i].float(), target_onehot.float())
                     else:
                         ce_loss = self.ce_loss(output_ds[i], target_ds[i][:, 0].long())
                     
@@ -697,7 +699,9 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
 
             for i in range(len(output)):
                 axes = tuple(range(2, len(output[i].size())))
-                output_act = nn.Sigmoid()(output[i]) if is_sigmoid else softmax_helper(output[i])
+                # output_act = nn.Sigmoid()(output[i]) if is_sigmoid else softmax_helper(output[i])
+                logits = output[i].float()
+                output_act = torch.sigmoid(logits) if is_sigmoid else torch.softmax(logits, dim=1)
                 # output_sigmoid (b, k, d, h, w), target (b, 1, d, h, w)
                 # get the tp, fp and fn terms we need
                 tp, fp, fn, _ = get_tp_fp_fn_tn(output_act, target, axes, mask=None) # e.g. tp = output * y_onehot
@@ -715,7 +719,7 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
                     target_onehot = torch.zeros_like(output[i], device=output[i].device)
                     target_onehot.scatter_(1, target.long(), 1)
                     assert (torch.argmax(target_onehot, dim=1) == target[:, 0].long()).all()
-                    ce_loss = F.binary_cross_entropy_with_logits(output[i], target_onehot)
+                    ce_loss = F.binary_cross_entropy_with_logits(output[i].float(), target_onehot.float())
                 else:
                     ce_loss = self.ce_loss(output[i], target[:, 0].long())
 
@@ -752,10 +756,11 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
             # Starting here it gets spicy!
             axes = tuple(range(2, len(output.size())))
             # network does not do softmax. We need to do softmax for dice
+            logits = output.float()
             if is_sigmoid:
-                output_softmax = nn.Sigmoid()(output)
+                output_softmax = torch.sigmoid(logits)
             else:
-                output_softmax = softmax_helper(output)
+                output_softmax = torch.softmax(logits, dim=1)
             # get the tp, fp and fn terms we need
             tp, fp, fn, _ = get_tp_fp_fn_tn(output_softmax, target, axes, mask=None)
             # for dice, compute nominator and denominator so that we have to accumulate only 2 instead of 3 variables
@@ -776,9 +781,9 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
                 target_onehot = torch.zeros_like(output, device=output.device)
                 target_onehot.scatter_(1, target.long(), 1)
                 assert (torch.argmax(target_onehot, dim=1) == target[:, 0].long()).all()
-                ce_loss = F.binary_cross_entropy_with_logits(output, target_onehot)
+                ce_loss = F.binary_cross_entropy_with_logits(output.float(), target_onehot.float())
             else:
-                ce_loss = self.ce_loss(output, target[:, 0].long())
+                ce_loss = self.ce_loss(output.float(), target[:, 0].long())
 
             dice_loss = (- (nominator + smooth) / (denominator + smooth)).mean()
             total_loss = ce_loss + dice_loss
@@ -789,7 +794,9 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
                 axes = tuple(range(2, len(output[i].size())))
 
                 # network does not do softmax. We need to do softmax for dice
-                output_act = nn.Sigmoid()(output[i]) if is_sigmoid else softmax_helper(output[i])
+                logits = output[i].float()
+                output_act = torch.sigmoid(logits) if is_sigmoid else torch.softmax(logits, dim=1)
+                # output_act = nn.Sigmoid()(output[i]) if is_sigmoid else softmax_helper(output[i])
 
                 # get the tp, fp and fn terms we need
                 tp, fp, fn, _ = get_tp_fp_fn_tn(output_act, target[i], axes, mask=None)
@@ -811,6 +818,8 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
                 else:
                     pass
 
+                nominator = nominator.float()
+                denominator = denominator.float()
                 if is_sigmoid:
                     if self.args.config.find('500Region') != -1:
                         target_onehot = target[i]
@@ -818,9 +827,9 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
                         target_onehot = torch.zeros_like(output[i], device=output[i].device)
                         target_onehot.scatter_(1, target[i].long(), 1) # target is a tuple
                         assert (torch.argmax(target_onehot, dim=1) == target[i][:, 0].long()).all()
-                    ce_loss = F.binary_cross_entropy_with_logits(output[i], target_onehot)
+                    ce_loss = F.binary_cross_entropy_with_logits(output[i].float(), target_onehot.float())
                 else:
-                    ce_loss = self.ce_loss(output[i], target[i][:, 0].long())
+                    ce_loss = self.ce_loss(output[i].float(), target[i][:, 0].long())
 
                 dice_loss = (- (nominator + smooth) / (denominator + smooth)).mean()
                 if total_loss is None:
