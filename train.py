@@ -106,7 +106,7 @@ def main():
                         help='Optimizer Betas (default: None, use opt default), from MAE ft')
     parser.add_argument('--weight_decay', default=3e-5, type=float)
 
-    parser.add_argument("--local-rank", type=int) # must pass
+    parser.add_argument("--local-rank", type=int, default=0) # must pass
     parser.add_argument('--world-size', default=1, type=int, help='number of nodes for distributed training')
     parser.add_argument('--rank', default=0, type=int, help='node rank for distributed training')
     parser.add_argument('--total_batch_size', default=None, type=int, help='node rank for distributed training')
