@@ -205,7 +205,7 @@ if args.measure_param_flops:
     sys.exit(0)
 
 
-checkpoint = torch.load(modelfile)
+checkpoint = torch.load(modelfile, weights_only=False)
 
 print("load epoch", checkpoint['epoch'])
 new_state_dict = OrderedDict()
