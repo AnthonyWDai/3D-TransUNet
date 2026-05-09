@@ -716,19 +716,28 @@ class HungarianMatcher3D(nn.Module):
         raise NotImplementedError 
 
         
-    def compute_dice_loss(self, inputs, targets):
-        """ mask dice loss
-            inputs (B*K, C, H, W)
-            target (B*K, D, H, W)
-        """
+    def compute_dice_loss(self, inputs, targets, eps=1e-6):
+        """mask dice loss, numerically stabilized"""
+        inputs = torch.nan_to_num(inputs.float(), nan=0.0, posinf=20.0, neginf=-20.0)
+        targets = torch.nan_to_num(targets.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+
         inputs = inputs.sigmoid()
+        inputs = torch.nan_to_num(inputs, nan=0.5, posinf=1.0, neginf=0.0)
+
         inputs = inputs.flatten(1)
         targets = targets.flatten(1)
-        num_masks = len(inputs)
+
+        num_masks = max(len(inputs), 1)
 
         numerator = 2 * (inputs * targets).sum(-1)
         denominator = inputs.sum(-1) + targets.sum(-1)
-        loss = 1 - (numerator + 1) / (denominator + 1)
+
+        dice = (numerator + eps) / (denominator + eps)
+        dice = torch.nan_to_num(dice, nan=0.0, posinf=0.0, neginf=0.0)
+
+        loss = 1 - dice
+        loss = torch.nan_to_num(loss, nan=1.0, posinf=1.0, neginf=1.0)
+
         return loss.sum() / num_masks
 
 
@@ -739,47 +748,53 @@ class HungarianMatcher3D(nn.Module):
         loss = loss.mean(1).sum() / num_masks
         return loss
 
-    def compute_dice(self, inputs, targets):
-        """ output (N_q, C, H, W)
-            target (K, D, H, W)
-        """
+    def compute_dice(self, inputs, targets, eps=1e-6):
+        """pairwise dice cost, numerically stabilized"""
+        inputs = torch.nan_to_num(inputs.float(), nan=0.0, posinf=20.0, neginf=-20.0)
+        targets = torch.nan_to_num(targets.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+
         inputs = inputs.sigmoid()
+        inputs = torch.nan_to_num(inputs, nan=0.5, posinf=1.0, neginf=0.0)
+
         inputs = inputs.flatten(1)
         targets = targets.flatten(1)
+
         numerator = 2 * torch.einsum("nc,mc->nm", inputs, targets)
         denominator = inputs.sum(-1)[:, None] + targets.sum(-1)[None, :]
-        loss = 1 - (numerator + 1) / (denominator + 1)
-        return loss # [N_q, K]
+
+        dice = (numerator + eps) / (denominator + eps)
+        dice = torch.nan_to_num(dice, nan=0.0, posinf=0.0, neginf=0.0)
+
+        loss = 1 - dice
+        loss = torch.nan_to_num(loss, nan=1.0, posinf=1.0, neginf=1.0)
+        return loss
 
 
     def compute_ce(self, inputs, targets):
-        """ output (N_q, C, H, W)
-            target (K, D, H, W)
-            return (N_q, K)
-        """
+        """pairwise mask ce cost"""
+        inputs = torch.nan_to_num(inputs.float(), nan=0.0, posinf=20.0, neginf=-20.0)
+        targets = torch.nan_to_num(targets.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+
         inputs = inputs.flatten(1)
         targets = targets.flatten(1)
-        hw = inputs.shape[1]
+        hw = max(inputs.shape[1], 1)
 
         pos = F.binary_cross_entropy_with_logits(
             inputs, torch.ones_like(inputs), reduction="none"
         )
-
         neg = F.binary_cross_entropy_with_logits(
             inputs, torch.zeros_like(inputs), reduction="none"
         )
 
+        pos = torch.nan_to_num(pos, nan=0.0, posinf=100.0, neginf=100.0)
+        neg = torch.nan_to_num(neg, nan=0.0, posinf=100.0, neginf=100.0)
+
         loss = torch.einsum("nc,mc->nm", pos, targets) + torch.einsum(
             "nc,mc->nm", neg, (1 - targets)
         )
-
-        return loss / hw
-
-        # target_onehot = torch.zeros_like(output, device=output.device)
-        # target_onehot.scatter_(1, target.long(), 1)
-        # assert (torch.argmax(target_onehot, dim=1) == target[:, 0].long()).all()
-        # ce_loss = F.binary_cross_entropy_with_logits(output, target_onehot)
-        # return ce_loss
+        loss = loss / hw
+        loss = torch.nan_to_num(loss, nan=1e6, posinf=1e6, neginf=1e6)
+        return loss
 
 
     @torch.no_grad()
@@ -915,6 +930,7 @@ def compute_loss_hungarian(outputs, targets, idx, matcher, num_classes, point_re
     else:
         loss_cls = F.cross_entropy(src_logits.transpose(1, 2), target_classes)
 
+    loss_cls = torch.nan_to_num(loss_cls, nan=0.0, posinf=100.0, neginf=100.0)
     # if no foreground objects exist in batch, only classification loss is used
     if num_total_targets == 0:
         return (cost_weight[0] / 10) * loss_cls
@@ -952,14 +968,11 @@ def compute_loss_hungarian(outputs, targets, idx, matcher, num_classes, point_re
         ).squeeze(1)
         src_masks, target_masks = point_logits, point_labels
 
-    loss_mask_ce = matcher.compute_ce_loss(src_masks, target_masks)
-    loss_mask_dice = matcher.compute_dice_loss(src_masks, target_masks)
+    loss_mask_ce = torch.nan_to_num(matcher.compute_ce_loss(src_masks, target_masks), nan=0.0, posinf=100.0, neginf=100.0)
+    loss_mask_dice = torch.nan_to_num(matcher.compute_dice_loss(src_masks, target_masks), nan=1.0, posinf=1.0, neginf=1.0)
 
-    loss = (
-        (cost_weight[0] / 10) * loss_cls
-        + (cost_weight[1] / 10) * loss_mask_ce
-        + (cost_weight[2] / 10) * loss_mask_dice
-    )
+    loss = (cost_weight[0]/10)*loss_cls + (cost_weight[1]/10)*loss_mask_ce + (cost_weight[2]/10)*loss_mask_dice
+    loss = torch.nan_to_num(loss, nan=0.0, posinf=100.0, neginf=100.0)
     return loss
 
 
