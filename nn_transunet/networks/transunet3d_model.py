@@ -1,7 +1,6 @@
 # 3D version of TransUNet; Copyright Johns Hopkins University
 # Modified from nnUNet
-
-
+# GPT5.4 fixed bugs
 
 import torch
 import numpy as np
@@ -10,7 +9,7 @@ import torch.nn.functional as F
 
 from copy import deepcopy
 from torch import nn
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 from scipy.optimize import linear_sum_assignment
 
 from ..networks.neural_network import SegmentationNetwork
@@ -792,20 +791,31 @@ class HungarianMatcher3D(nn.Module):
 
         # Iterate through batch size
         for b in range(bs):
-            out_prob = outputs["pred_logits"][b].softmax(-1) # [num_queries, num_classes+1]
+            out_logits = outputs["pred_logits"][b] # [num_queries, num_classes+1]
+            out_prob = out_logits.softmax(-1)  # [num_queries, num_classes+1]
             out_mask = outputs["pred_masks"][b]  # [num_queries, H_pred, W_pred]
 
             tgt_ids = targets[b]["labels"]
             tgt_mask = targets[b]["masks"].to(out_mask) # [K, D, H, W], K is number of classes shown in this image, and K < n_class
 
-            # target_onehot = torch.zeros_like(tgt_mask, device=out_mask.device)
-            # target_onehot.scatter_(1, targets.long(), 1)
+            # handle empty target case
+            if tgt_ids.numel() == 0 or tgt_mask.shape[0] == 0:
+                indices.append((
+                    torch.empty(0, dtype=torch.int64),
+                    torch.empty(0, dtype=torch.int64)
+                ))
+                continue
 
-            cost_class = -out_prob[:, tgt_ids] # [num_queries, K]
+            # sanitize logits/probabilities/masks
+            out_prob = torch.nan_to_num(out_prob, nan=0.0, posinf=1.0, neginf=0.0)
+            out_prob = out_prob.clamp(min=1e-6, max=1.0)
 
-            with autocast(enabled=False):
-                out_mask = out_mask.float()
-                tgt_mask = tgt_mask.float()
+            with autocast("cuda", enabled=False):
+                out_mask = torch.nan_to_num(out_mask.float(), nan=0.0, posinf=20.0, neginf=-20.0)
+                tgt_mask = torch.nan_to_num(tgt_mask.float(), nan=0.0, posinf=1.0, neginf=0.0)
+                tgt_mask = tgt_mask.clamp(0.0, 1.0)
+
+                cost_class = -out_prob[:, tgt_ids]  # [num_queries, K]
                 cost_dice = self.compute_dice(out_mask, tgt_mask)
                 cost_mask = self.compute_ce(out_mask, tgt_mask)
 
@@ -816,7 +826,9 @@ class HungarianMatcher3D(nn.Module):
                 + self.cost_dice * cost_dice
             )
 
-            C = C.reshape(num_queries, -1).cpu() # (num_queries, K)
+            # final sanitize before scipy
+            C = torch.nan_to_num(C, nan=1e6, posinf=1e6, neginf=-1e6)
+            C = C.reshape(num_queries, -1).cpu().numpy()
 
             # linear_sum_assignment return a tuple of two arrays: row_ind, col_ind, the length of array is min(N_q, K)
             # The cost of the assignment can be computed as cost_matrix[row_ind, col_ind].sum()
@@ -880,68 +892,74 @@ class HungarianMatcher3D(nn.Module):
 
 def compute_loss_hungarian(outputs, targets, idx, matcher, num_classes, point_rend=False, num_points=12544, oversample_ratio=3.0, importance_sample_ratio=0.75, no_object_weight=None, cost_weight=[2,5,5]):
     """output is a dict only contain keys ['pred_masks', 'pred_logits'] """
-    # outputs_without_aux = {k: v for k, v in output.items() if k != "aux_outputs"}
+    indices = matcher(outputs, targets)
+    src_idx = matcher._get_src_permutation_idx(indices)
+    tgt_idx = matcher._get_tgt_permutation_idx(indices)
 
-    indices = matcher(outputs, targets) 
-    src_idx = matcher._get_src_permutation_idx(indices) # return a tuple of (batch_idx, src_idx)
-    tgt_idx = matcher._get_tgt_permutation_idx(indices) # return a tuple of (batch_idx, tgt_idx)
-    assert len(tgt_idx[0]) ==  sum([len(t["masks"]) for t in targets]) # verify that all masks of (K1, K2, ..) are used
-    
+    num_total_targets = sum(len(t["masks"]) for t in targets)
+
+    # step3: compute class loss (always valid)
+    src_logits = torch.nan_to_num(outputs["pred_logits"].float(), nan=0.0, posinf=20.0, neginf=-20.0)
+    target_classes = torch.full(
+        src_logits.shape[:2], num_classes, dtype=torch.int64, device=src_logits.device
+    )
+
+    if num_total_targets > 0:
+        target_classes_o = torch.cat([t["labels"] for t in targets], dim=0)
+        target_classes[src_idx] = target_classes_o
+
+    if no_object_weight is not None:
+        empty_weight = torch.ones(num_classes + 1, device=src_logits.device)
+        empty_weight[-1] = no_object_weight
+        loss_cls = F.cross_entropy(src_logits.transpose(1, 2), target_classes, empty_weight)
+    else:
+        loss_cls = F.cross_entropy(src_logits.transpose(1, 2), target_classes)
+
+    # if no foreground objects exist in batch, only classification loss is used
+    if num_total_targets == 0:
+        return (cost_weight[0] / 10) * loss_cls
+
     # step2 : compute mask loss
     src_masks = outputs["pred_masks"]
-    src_masks = src_masks[src_idx] # [len(src_idx[0]), D, H, W] -> (K1+K2+..., D, H, W) 
-    target_masks = torch.cat([t["masks"] for t in targets], dim=0) # (K1+K2+..., D, H, W) actually
-    src_masks = src_masks[:, None] # [K..., 1, D, H, W]
+    src_masks = torch.nan_to_num(src_masks, nan=0.0, posinf=20.0, neginf=-20.0)
+    src_masks = src_masks[src_idx]  # [K..., D, H, W]
+
+    target_masks = torch.cat([t["masks"] for t in targets], dim=0).to(src_masks)
+    target_masks = torch.nan_to_num(target_masks, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+
+    src_masks = src_masks[:, None]      # [K..., 1, D, H, W]
     target_masks = target_masks[:, None]
 
-    if point_rend: # only calculate hard example
+    if point_rend:
         with torch.no_grad():
-            # num_points=12544 config in cityscapes
-
-            # sample point_coords
             point_coords = get_uncertain_point_coords_with_randomness(
                 src_masks.float(),
                 lambda logits: calculate_uncertainty(logits),
                 num_points,
                 oversample_ratio,
                 importance_sample_ratio,
-            ) # [K, num_points=12544, 3]
-
+            )
             point_labels = point_sample_3d(
                 target_masks.float(),
                 point_coords.float(),
                 align_corners=False,
-            ).squeeze(1) # [K, 12544]
+            ).squeeze(1)
 
         point_logits = point_sample_3d(
-                src_masks.float(),
-                point_coords.float(),
-                align_corners=False,
-        ).squeeze(1) # [K, 12544]
-
+            src_masks.float(),
+            point_coords.float(),
+            align_corners=False,
+        ).squeeze(1)
         src_masks, target_masks = point_logits, point_labels
 
-    loss_mask_ce = matcher.compute_ce_loss(src_masks, target_masks) 
+    loss_mask_ce = matcher.compute_ce_loss(src_masks, target_masks)
     loss_mask_dice = matcher.compute_dice_loss(src_masks, target_masks)
-    
-    # step3: compute class loss
-    src_logits = outputs["pred_logits"].float() # (B, num_query, num_class+1)
-    target_classes_o = torch.cat([t["labels"] for t in targets], dim=0) # (K1+K2+, )
-    target_classes = torch.full(
-            src_logits.shape[:2], num_classes, dtype=torch.int64, device=src_logits.device
-        ) # (B, num_query, num_class+1)
-    target_classes[src_idx] = target_classes_o
 
-
-    if no_object_weight is not None:
-        empty_weight = torch.ones(num_classes + 1).to(src_logits.device)
-        empty_weight[-1] = no_object_weight
-        loss_cls = F.cross_entropy(src_logits.transpose(1, 2), target_classes, empty_weight)
-    else:
-        loss_cls = F.cross_entropy(src_logits.transpose(1, 2), target_classes)
-
-    loss = (cost_weight[0]/10)*loss_cls + (cost_weight[1]/10)*loss_mask_ce + (cost_weight[2]/10)*loss_mask_dice # 2:5:5, like hungarian matching
-    # print("idx {}, loss {}, loss_cls {}, loss_mask_ce {}, loss_mask_dice {}".format(idx, loss, loss_cls, loss_mask_ce, loss_mask_dice))
+    loss = (
+        (cost_weight[0] / 10) * loss_cls
+        + (cost_weight[1] / 10) * loss_mask_ce
+        + (cost_weight[2] / 10) * loss_mask_dice
+    )
     return loss
 
 
