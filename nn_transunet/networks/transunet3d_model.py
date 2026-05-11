@@ -740,12 +740,21 @@ class HungarianMatcher3D(nn.Module):
 
         return loss.sum() / num_masks
 
-
     def compute_ce_loss(self, inputs, targets):
-        """mask ce loss"""
-        num_masks = len(inputs)
-        loss = F.binary_cross_entropy_with_logits(inputs.flatten(1), targets.flatten(1), reduction="none")
-        loss = loss.mean(1).sum() / num_masks
+        with autocast("cuda", enabled=False):
+            inputs = torch.nan_to_num(inputs.float(), nan=0.0, posinf=20.0, neginf=-20.0)
+            targets = torch.nan_to_num(targets.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+
+            inputs = inputs.flatten(1)
+            targets = targets.flatten(1)
+
+            if inputs.shape[0] == 0:
+                return inputs.new_tensor(0.0)
+
+            loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+            loss = torch.nan_to_num(loss, nan=0.0, posinf=100.0, neginf=100.0)
+            loss = loss.mean(1).sum() / inputs.shape[0]
+            loss = torch.nan_to_num(loss, nan=0.0, posinf=100.0, neginf=100.0)
         return loss
 
     def compute_dice(self, inputs, targets, eps=1e-6):
@@ -905,15 +914,15 @@ class HungarianMatcher3D(nn.Module):
         return batch_idx, tgt_idx
 
 
-def compute_loss_hungarian(outputs, targets, idx, matcher, num_classes, point_rend=False, num_points=12544, oversample_ratio=3.0, importance_sample_ratio=0.75, no_object_weight=None, cost_weight=[2,5,5]):
-    """output is a dict only contain keys ['pred_masks', 'pred_logits'] """
+def compute_loss_hungarian(outputs, targets, idx, matcher, num_classes, point_rend=False, num_points=12544,
+                           oversample_ratio=3.0, importance_sample_ratio=0.75, no_object_weight=None,
+                           cost_weight=[2,5,5]):
     indices = matcher(outputs, targets)
     src_idx = matcher._get_src_permutation_idx(indices)
     tgt_idx = matcher._get_tgt_permutation_idx(indices)
 
     num_total_targets = sum(len(t["masks"]) for t in targets)
 
-    # step3: compute class loss (always valid)
     src_logits = torch.nan_to_num(outputs["pred_logits"].float(), nan=0.0, posinf=20.0, neginf=-20.0)
     target_classes = torch.full(
         src_logits.shape[:2], num_classes, dtype=torch.int64, device=src_logits.device
@@ -931,19 +940,22 @@ def compute_loss_hungarian(outputs, targets, idx, matcher, num_classes, point_re
         loss_cls = F.cross_entropy(src_logits.transpose(1, 2), target_classes)
 
     loss_cls = torch.nan_to_num(loss_cls, nan=0.0, posinf=100.0, neginf=100.0)
-    # if no foreground objects exist in batch, only classification loss is used
-    if num_total_targets == 0:
+
+    matched_count = src_idx[0].numel()
+    if num_total_targets == 0 or matched_count == 0:
         return (cost_weight[0] / 10) * loss_cls
 
-    # step2 : compute mask loss
     src_masks = outputs["pred_masks"]
-    src_masks = torch.nan_to_num(src_masks, nan=0.0, posinf=20.0, neginf=-20.0)
-    src_masks = src_masks[src_idx]  # [K..., D, H, W]
+    src_masks = torch.nan_to_num(src_masks.float(), nan=0.0, posinf=20.0, neginf=-20.0)
+    src_masks = src_masks[src_idx]
 
     target_masks = torch.cat([t["masks"] for t in targets], dim=0).to(src_masks)
-    target_masks = torch.nan_to_num(target_masks, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+    target_masks = torch.nan_to_num(target_masks.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
 
-    src_masks = src_masks[:, None]      # [K..., 1, D, H, W]
+    if src_masks.shape[0] == 0 or target_masks.shape[0] == 0:
+        return (cost_weight[0] / 10) * loss_cls
+
+    src_masks = src_masks[:, None]
     target_masks = target_masks[:, None]
 
     if point_rend:
@@ -966,14 +978,15 @@ def compute_loss_hungarian(outputs, targets, idx, matcher, num_classes, point_re
             point_coords.float(),
             align_corners=False,
         ).squeeze(1)
-        src_masks, target_masks = point_logits, point_labels
 
-    loss_mask_ce = torch.nan_to_num(matcher.compute_ce_loss(src_masks, target_masks), nan=0.0, posinf=100.0, neginf=100.0)
-    loss_mask_dice = torch.nan_to_num(matcher.compute_dice_loss(src_masks, target_masks), nan=1.0, posinf=1.0, neginf=1.0)
+        src_masks = torch.nan_to_num(point_logits, nan=0.0, posinf=20.0, neginf=-20.0)
+        target_masks = torch.nan_to_num(point_labels, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+
+    loss_mask_ce = matcher.compute_ce_loss(src_masks, target_masks)
+    loss_mask_dice = matcher.compute_dice_loss(src_masks, target_masks)
 
     loss = (cost_weight[0]/10)*loss_cls + (cost_weight[1]/10)*loss_mask_ce + (cost_weight[2]/10)*loss_mask_dice
-    loss = torch.nan_to_num(loss, nan=0.0, posinf=100.0, neginf=100.0)
-    return loss
+    return torch.nan_to_num(loss, nan=0.0, posinf=100.0, neginf=100.0)
 
 
 def point_sample_3d(input, point_coords, **kwargs):
