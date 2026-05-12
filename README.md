@@ -1,4 +1,4 @@
-Note: There are so many bugs on running it, such as weight_only, torchrun, nan loss values. Abandon.
+Note: There are so many bugs on running it, such as weight_only, torchrun, nan loss values. Abandoned.
 
 This is the official repository of our project ["3D TransUNet: Advancing Medical Image Segmentation through Vision Transformers"](https://arxiv.org/abs/2310.07781). 
 
