@@ -483,7 +483,7 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
     def on_after_backward(self):
         # added by jieneng: https://github.com/PyTorchLightning/pytorch-lightning/issues/4956
         valid_gradients = True
-        for name, param in self.network.parameters():
+        for name, param in self.network.named_parameters():
             if param.grad is not None:
                 valid_gradients = not (torch.isnan(param.grad).any() or torch.isinf(param.grad).any())
                 if not valid_gradients:
@@ -500,7 +500,7 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
         target = data_dict['target']
 
         if self.args.merge_femur:
-            target[target==16] = 15
+            target[target == 16] = 15
 
         data = maybe_to_torch(data)
         target = maybe_to_torch(target)
@@ -509,70 +509,59 @@ class nnUNetTrainerV2_DDP(nnUNetTrainerV2):
             data = to_cuda(data, gpu_id=None)
             target = to_cuda(target, gpu_id=None)
 
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
 
+        is_c2f = self.args.model.find('C2F') != -1
+        is_max = self.args.model_params.get('is_max', self.args.model.find('max') != -1)
+        is_max_hungarian = ('is_max_hungarian' in self.args.model_params.keys() and self.args.model_params['is_max_hungarian'])
+        is_max_cls = ('is_max_cls' in self.args.model_params.keys() and self.args.model_params['is_max_cls'])
+        is_max_ds = ('is_max_ds' in self.args.model_params.keys() and self.args.model_params['is_max_ds'])
+        point_rend = ('point_rend' in self.args.model_params.keys() and self.args.model_params['point_rend'])
+        num_point_rend = self.args.model_params['num_point_rend'] if point_rend else None
+        no_object_weight = self.args.model_params['no_object_weight'] if 'no_object_weight' in self.args.model_params.keys() else None
 
-        if self.fp16:
-            with torch.autograd.set_detect_anomaly(True):
-                with autocast("cuda"):
-                    is_c2f = self.args.model.find('C2F') != -1
-                    is_max = self.args.model_params.get('is_max', self.args.model.find('max') != -1)
-                    is_max_hungarian = ('is_max_hungarian' in self.args.model_params.keys() and self.args.model_params['is_max_hungarian'])
-                    is_max_cls = ('is_max_cls' in self.args.model_params.keys() and self.args.model_params['is_max_cls'])
-                    is_max_ds =('is_max_ds' in self.args.model_params.keys() and self.args.model_params['is_max_ds'])
-                    point_rend =('point_rend' in self.args.model_params.keys() and self.args.model_params['point_rend'])
-                    num_point_rend = self.args.model_params['num_point_rend'] if point_rend else None
-                    no_object_weight = self.args.model_params['no_object_weight'] if 'no_object_weight' in self.args.model_params.keys() else None
+        with torch.autograd.set_detect_anomaly(True):
+            if is_c2f:
+                output = self.network(data, target[0] if is_c2f else None)
+            else:
+                output = self.network(data)
 
-                    if is_c2f:
-                        output = self.network(data, target[0] if is_c2f else None)
-                    else:
-                        output = self.network(data) # transunet output [2, 17, 64, 160, 160]
-                    del data
-                    if is_max and not ('is_masking_argmax' in self.args.model_params.keys() and self.args.model_params['is_masking_argmax']):
-                        self.args.is_sigmoid = True
-                    
-                    if self.disable_ds:
-                        if not (is_max or is_c2f):
-                            if isinstance(output, (tuple, list)):
-                                output = output[0]
-                        if isinstance(target, (tuple, list)):
-                            target = target[0]
-
-
-                l = self.compute_loss(output, target, is_max, is_c2f, self.args.is_sigmoid, is_max_hungarian, is_max_ds, point_rend, num_point_rend, no_object_weight)
-
-                if do_backprop:
-                    self.amp_grad_scaler.scale(l).backward()
-                    """
-                    for name, param in self.network.named_parameters():
-                        if param.grad is None:
-                            print("unused paramter found in ", name)
-                    """
-                    self.amp_grad_scaler.unscale_(self.optimizer)
-                    if self.args.skip_grad_nan:
-                        self.on_after_backward()
-                    torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-                    self.amp_grad_scaler.step(self.optimizer)
-                    self.amp_grad_scaler.update()
-            
-        else:
-            output = self.network(data)
             del data
-            l = self.compute_loss(output, target)
+
+            if is_max and not ('is_masking_argmax' in self.args.model_params.keys() and self.args.model_params['is_masking_argmax']):
+                self.args.is_sigmoid = True
+
+            if self.disable_ds:
+                if not (is_max or is_c2f):
+                    if isinstance(output, (tuple, list)):
+                        output = output[0]
+                if isinstance(target, (tuple, list)):
+                    target = target[0]
+
+            l = self.compute_loss(
+                output, target,
+                is_max, is_c2f, self.args.is_sigmoid,
+                is_max_hungarian, is_max_ds,
+                point_rend, num_point_rend, no_object_weight
+            )
 
             if do_backprop:
+                if not torch.isfinite(l):
+                    raise RuntimeError(f"Non-finite loss detected: {l}")
+
                 l.backward()
-                # self.on_after_backward()
-                torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+
+                if self.args.skip_grad_nan:
+                    self.on_after_backward()
+
+                torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12.0)
                 self.optimizer.step()
-        
+
         if run_online_evaluation:
             with torch.no_grad():
-                self.run_online_evaluation(output, target) # compute dice for train sample?
+                self.run_online_evaluation(output, target)
 
         del target
-
         return l.detach().cpu().numpy()
 
     def compute_loss(self, output, target, is_max=False, is_c2f=False, is_sigmoid=False, is_max_hungarian=False, is_max_ds=False, point_rend=False, num_point_rend=None, no_object_weight=None):
