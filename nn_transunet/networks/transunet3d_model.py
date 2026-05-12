@@ -958,7 +958,7 @@ class HungarianMatcher3D(nn.Module):
 
     def compute_cls_loss(self, inputs, targets):
         raise NotImplementedError
-
+    
     def compute_dice_loss(self, inputs, targets, eps=1e-6):
         inputs = sanitize_logits(inputs).sigmoid()
         targets = sanitize_targets(targets)
@@ -972,8 +972,7 @@ class HungarianMatcher3D(nn.Module):
         dice = (numerator + eps) / (denominator + eps)
         dice = torch.nan_to_num(dice, nan=0.0, posinf=0.0, neginf=0.0)
         loss = 1 - dice
-        loss = torch.nan_to_num(loss, nan=1.0, posinf=1.0, neginf=1.0)
-        return loss.sum() / num_masks
+        return torch.nan_to_num(loss.sum() / num_masks, nan=1.0, posinf=1.0, neginf=1.0)
 
     def compute_ce_loss(self, inputs, targets):
         with autocast("cuda", enabled=False):
@@ -991,21 +990,20 @@ class HungarianMatcher3D(nn.Module):
             loss = loss.mean(1).sum() / inputs.shape[0]
             loss = torch.nan_to_num(loss, nan=0.0, posinf=100.0, neginf=100.0)
         return loss
-
-    def compute_dice_loss(self, inputs, targets, eps=1e-6):
+    
+    def compute_dice(self, inputs, targets, eps=1e-6):
         inputs = sanitize_logits(inputs).sigmoid()
         targets = sanitize_targets(targets)
 
         inputs = inputs.flatten(1)
         targets = targets.flatten(1)
 
-        num_masks = max(len(inputs), 1)
-        numerator = 2 * (inputs * targets).sum(-1)
-        denominator = inputs.sum(-1) + targets.sum(-1)
+        numerator = 2 * torch.einsum("nc,mc->nm", inputs, targets)
+        denominator = inputs.sum(-1)[:, None] + targets.sum(-1)[None, :]
         dice = (numerator + eps) / (denominator + eps)
         dice = torch.nan_to_num(dice, nan=0.0, posinf=0.0, neginf=0.0)
         loss = 1 - dice
-        return torch.nan_to_num(loss.sum() / num_masks, nan=1.0, posinf=1.0, neginf=1.0)
+        return torch.nan_to_num(loss, nan=1.0, posinf=1.0, neginf=1.0)
 
     def compute_ce(self, inputs, targets):
         with autocast("cuda", enabled=False):
